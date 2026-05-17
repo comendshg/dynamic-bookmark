@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Dynamic bookmark",
+  "version": "0.0.1",
+  "description": "一个自动更新收藏夹访问进度的浏览器插件",
+  "permissions": ["storage", "tabs", "bookmarks"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
