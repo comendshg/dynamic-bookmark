@@ -3,8 +3,8 @@
 // 会话存储中的键名，用于保存标签页相关的状态映射
 const SESSION_KEY = "tabStateMap"
 
-// 自动监控的书签文件夹名称，要求位于书签栏根目录下
-const MONITOR_FOLDER_TITLE = "📋 Auto-Progress"
+// 持久化存储中的键名，用于保存需要接管的收藏夹名称列表
+const MANAGED_FOLDER_TITLES_KEY = "managedFolderTitles"
 
 // 每个标签页需要保存的信息：最后访问的 URL 和标题
 type TabState = {
@@ -30,6 +30,9 @@ type MatchProfile =
 // 优先使用 session 存储（如果可用），否则降级到 local
 const storageArea = chrome.storage.session ?? chrome.storage.local
 
+// 收藏夹接管配置需要跨浏览器重启保存，因此固定使用 local
+const persistentStorageArea = chrome.storage.local
+
 // 从 storage 中读取整个映射表，若不存在则返回空对象
 async function getTabStateMap(): Promise<TabStateMap> {
   const result = await storageArea.get(SESSION_KEY)
@@ -39,6 +42,49 @@ async function getTabStateMap(): Promise<TabStateMap> {
 // 将映射表写回 storage
 async function setTabStateMap(map: TabStateMap): Promise<void> {
   await storageArea.set({ [SESSION_KEY]: map })
+}
+
+function normalizeFolderTitle(title: string): string {
+  return title.trim()
+}
+
+function normalizeManagedFolderTitles(titles: string[]): string[] {
+  const uniqueTitles = new Set<string>()
+
+  for (const title of titles) {
+    const normalizedTitle = normalizeFolderTitle(title)
+
+    if (normalizedTitle) {
+      uniqueTitles.add(normalizedTitle)
+    }
+  }
+
+  return [...uniqueTitles]
+}
+
+async function getManagedFolderTitles(): Promise<string[]> {
+  const result = await persistentStorageArea.get(MANAGED_FOLDER_TITLES_KEY)
+  const storedTitles = result[MANAGED_FOLDER_TITLES_KEY]
+
+  if (Array.isArray(storedTitles)) {
+    return normalizeManagedFolderTitles(storedTitles.filter((title): title is string => typeof title === "string"))
+  }
+
+  return []
+}
+
+async function setManagedFolderTitles(titles: string[]): Promise<void> {
+  await persistentStorageArea.set({
+    [MANAGED_FOLDER_TITLES_KEY]: normalizeManagedFolderTitles(titles)
+  })
+}
+
+async function ensureManagedFolderSettings(): Promise<void> {
+  const result = await persistentStorageArea.get(MANAGED_FOLDER_TITLES_KEY)
+
+  if (result[MANAGED_FOLDER_TITLES_KEY] === undefined) {
+    await setManagedFolderTitles([])
+  }
 }
 
 // 简单判断是否为 http(s) 类型的 URL
@@ -119,13 +165,20 @@ async function getBookmarkBarRootNode(): Promise<chrome.bookmarks.BookmarkTreeNo
   return directChildren.find((node) => node.id === "1") ?? directChildren[0]
 }
 
-async function findMonitorFolderNode(): Promise<chrome.bookmarks.BookmarkTreeNode | undefined> {
+async function findFolderNodesByTitles(titles: string[]): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
+  const normalizedTitles = new Set(normalizeManagedFolderTitles(titles))
+
+  if (normalizedTitles.size === 0) {
+    return []
+  }
+
   const bookmarkBarRoot = await getBookmarkBarRootNode()
 
   if (!bookmarkBarRoot) {
-    return undefined
+    return []
   }
 
+  const matchedNodes: chrome.bookmarks.BookmarkTreeNode[] = []
   const stack = [...(bookmarkBarRoot.children ?? [])]
 
   while (stack.length > 0) {
@@ -135,8 +188,8 @@ async function findMonitorFolderNode(): Promise<chrome.bookmarks.BookmarkTreeNod
       continue
     }
 
-    if (!node.url && node.title === MONITOR_FOLDER_TITLE) {
-      return node
+    if (!node.url && normalizedTitles.has(node.title)) {
+      matchedNodes.push(node)
     }
 
     if (node.children?.length) {
@@ -144,35 +197,11 @@ async function findMonitorFolderNode(): Promise<chrome.bookmarks.BookmarkTreeNod
     }
   }
 
-  return undefined
+  return matchedNodes
 }
 
 async function ensureMonitorFolderNode(): Promise<chrome.bookmarks.BookmarkTreeNode | undefined> {
-  const existingNode = await findMonitorFolderNode()
-
-  if (existingNode) {
-    return existingNode
-  }
-
-  const bookmarkBarRoot = await getBookmarkBarRootNode()
-
-  if (!bookmarkBarRoot) {
-    console.error("[Dynamic Bookmark] Cannot locate bookmarks bar root")
-    return undefined
-  }
-
-  try {
-    const createdNode = await chrome.bookmarks.create({
-      parentId: bookmarkBarRoot.id,
-      title: MONITOR_FOLDER_TITLE
-    })
-
-    console.log(`[Dynamic Bookmark] Created monitor folder: ${MONITOR_FOLDER_TITLE}`)
-    return createdNode
-  } catch (error) {
-    console.error("[Dynamic Bookmark] Failed to create monitor folder:", error)
-    return undefined
-  }
+  return undefined
 }
 
 async function collectBookmarksUnderFolder(folderNode: chrome.bookmarks.BookmarkTreeNode): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
@@ -196,6 +225,27 @@ async function collectBookmarksUnderFolder(folderNode: chrome.bookmarks.Bookmark
   }
 
   return bookmarks
+}
+
+async function collectBookmarksUnderManagedFolders(): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
+  const managedFolderTitles = await getManagedFolderTitles()
+
+  if (managedFolderTitles.length === 0) {
+    return []
+  }
+
+  const folderNodes = await findFolderNodesByTitles(managedFolderTitles)
+  const bookmarksById = new Map<string, chrome.bookmarks.BookmarkTreeNode>()
+
+  for (const folderNode of folderNodes) {
+    const bookmarks = await collectBookmarksUnderFolder(folderNode)
+
+    for (const bookmark of bookmarks) {
+      bookmarksById.set(bookmark.id, bookmark)
+    }
+  }
+
+  return [...bookmarksById.values()]
 }
 
 function isBookmarkMatch(bookmarkUrl: string, profile: MatchProfile): boolean {
@@ -224,13 +274,7 @@ async function findBookmarkToUpdate(sourceUrl: string): Promise<chrome.bookmarks
     return undefined
   }
 
-  const monitorFolderNode = await ensureMonitorFolderNode()
-
-  if (!monitorFolderNode) {
-    return undefined
-  }
-
-  const candidateBookmarks = await collectBookmarksUnderFolder(monitorFolderNode)
+  const candidateBookmarks = await collectBookmarksUnderManagedFolders()
   const normalizedSourceUrl = normalizeUrl(sourceUrl)
 
   if (profile.type === "bilibili") {
@@ -332,8 +376,34 @@ async function handleTabClosed(tabId: number): Promise<void> {
 
 // 扩展启动时立即确保监控文件夹存在，避免第一次关闭标签页时才临时创建目录。
 async function initializeMonitorFolder(): Promise<void> {
-  await ensureMonitorFolderNode()
+  await ensureManagedFolderSettings()
 }
+
+chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+  const nextMessage = message as {
+    type?: string
+    folderTitles?: unknown
+  }
+
+  if (nextMessage.type !== "set-managed-folders") {
+    return
+  }
+
+  void (async () => {
+    const folderTitles = Array.isArray(nextMessage.folderTitles)
+      ? nextMessage.folderTitles.filter((title): title is string => typeof title === "string")
+      : []
+
+    await setManagedFolderTitles(folderTitles)
+    await ensureMonitorFolderNode()
+    sendResponse({ ok: true, folderTitles: normalizeManagedFolderTitles(folderTitles) })
+  })().catch((error) => {
+    console.error("[Dynamic Bookmark] Failed to update managed folders:", error)
+    sendResponse({ ok: false })
+  })
+
+  return true
+})
 
 chrome.runtime.onInstalled.addListener(() => {
   void initializeMonitorFolder()
