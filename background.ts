@@ -348,16 +348,8 @@ async function handleTabClosed(tabId: number): Promise<void> {
       if (targetBookmark) {
         console.log(`[Dynamic Bookmark] Updating bookmark ${targetBookmark.id} with URL: ${state.lastUrl}`)
 
-        // 关闭标签页后，将最新 URL 与最新标题一起覆盖回原书签。
-        // 如果标题缺失，则保留原书签标题，避免把合法标题误写成空字符串。
-        const updatePayload: chrome.bookmarks.BookmarkChangesArg = {
-          url: state.lastUrl
-        }
-
-        const nextTitle = state.lastTitle?.trim()
-        if (nextTitle) {
-          updatePayload.title = nextTitle
-        }
+        // 关闭标签页后，仅更新书签的 URL，保持原书签标题不变。
+        const updatePayload: chrome.bookmarks.BookmarkChangesArg = { url: state.lastUrl }
 
         await chrome.bookmarks.update(targetBookmark.id, updatePayload)
         console.log(`[Dynamic Bookmark] Successfully updated bookmark ${targetBookmark.id}`)
