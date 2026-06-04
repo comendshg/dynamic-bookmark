@@ -166,6 +166,7 @@ async function getBookmarkBarRootNode(): Promise<chrome.bookmarks.BookmarkTreeNo
 }
 
 async function findFolderNodesByTitles(titles: string[]): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
+  // 保持向后兼容：此函数仍然存在，但更通用的查找器在下方实现。
   const normalizedTitles = new Set(normalizeManagedFolderTitles(titles))
 
   if (normalizedTitles.size === 0) {
@@ -184,20 +185,66 @@ async function findFolderNodesByTitles(titles: string[]): Promise<chrome.bookmar
   while (stack.length > 0) {
     const node = stack.pop()
 
-    if (!node) {
-      continue
-    }
+    if (!node) continue
 
     if (!node.url && normalizedTitles.has(node.title)) {
       matchedNodes.push(node)
     }
 
-    if (node.children?.length) {
-      stack.push(...node.children)
-    }
+    if (node.children?.length) stack.push(...node.children)
   }
 
   return matchedNodes
+}
+
+// 支持按 "父 / 子 / 子" 路径查找节点，也支持传统只按标题匹配的标识符。
+async function findFolderNodesByIdentifiers(identifiers: string[]): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
+  const bookmarkBarRoot = await getBookmarkBarRootNode()
+
+  if (!bookmarkBarRoot || identifiers.length === 0) return []
+
+  const matchedById = new Map<string, chrome.bookmarks.BookmarkTreeNode>()
+
+  for (const raw of identifiers) {
+    if (typeof raw !== "string") continue
+
+    const id = raw.trim()
+    if (!id) continue
+
+    if (id.includes("/")) {
+      const parts = id.split("/").map((s) => s.trim()).filter(Boolean)
+      if (parts.length === 0) continue
+
+      // 从书签栏一级开始匹配
+      let currentNodes = bookmarkBarRoot.children ?? []
+      let foundNode: chrome.bookmarks.BookmarkTreeNode | undefined
+
+      for (const part of parts) {
+        foundNode = (currentNodes.find((n) => n.title === part && !n.url))
+
+        if (!foundNode) break
+
+        currentNodes = foundNode.children ?? []
+      }
+
+      if (foundNode) matchedById.set(foundNode.id, foundNode)
+    } else {
+      // legacy: match by title anywhere
+      const stack = [...(bookmarkBarRoot.children ?? [])]
+
+      while (stack.length > 0) {
+        const node = stack.pop()
+
+        if (!node) continue
+
+        if (!node.url && node.title === id) matchedById.set(node.id, node)
+
+        if (node.children?.length) stack.push(...node.children)
+      }
+    }
+  }
+
+  return [...matchedById.values()]
 }
 
 async function ensureMonitorFolderNode(): Promise<chrome.bookmarks.BookmarkTreeNode | undefined> {
@@ -234,7 +281,7 @@ async function collectBookmarksUnderManagedFolders(): Promise<chrome.bookmarks.B
     return []
   }
 
-  const folderNodes = await findFolderNodesByTitles(managedFolderTitles)
+  const folderNodes = await findFolderNodesByIdentifiers(managedFolderTitles)
   const bookmarksById = new Map<string, chrome.bookmarks.BookmarkTreeNode>()
 
   for (const folderNode of folderNodes) {
