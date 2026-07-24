@@ -8,7 +8,7 @@ const MANAGED_FOLDER_TITLES_KEY = "managedFolderTitles"
 
 // 每个标签页需要保存的信息：最后访问的 URL 和标题
 type TabState = {
-  // 最近一次记录到的 URL（用于在标签关闭时更新书签）
+  // 最近一次记录到的 URL（用于在标签关闭或离开页面时更新书签）
   lastUrl?: string
   // 最近一次记录到的标题（用于在标签关闭时同步更新书签标题）
   lastTitle?: string
@@ -340,34 +340,80 @@ async function findBookmarkToUpdate(sourceUrl: string): Promise<chrome.bookmarks
   )
 }
 
+async function commitBookmarkProgress(sourceUrl: string): Promise<boolean> {
+  try {
+    const targetBookmark = await findBookmarkToUpdate(sourceUrl)
+
+    if (!targetBookmark) {
+      console.log(`[Dynamic Bookmark] No matching bookmark found for URL: ${sourceUrl}`)
+      return false
+    }
+
+    console.log(`[Dynamic Bookmark] Updating bookmark ${targetBookmark.id} with URL: ${sourceUrl}`)
+
+    // 只更新 URL，保持原书签标题不变。
+    await chrome.bookmarks.update(targetBookmark.id, { url: sourceUrl })
+    console.log(`[Dynamic Bookmark] Successfully updated bookmark ${targetBookmark.id}`)
+    return true
+  } catch (error) {
+    console.error(`[Dynamic Bookmark] Failed to update bookmark for URL: ${sourceUrl}`, error)
+    return false
+  }
+}
+
+async function clearTabState(tabId: number): Promise<void> {
+  const map = await getTabStateMap()
+  delete map[String(tabId)]
+  await setTabStateMap(map)
+}
+
 // 当标签页信息发生变化时，记录最新 URL 和标题，供关闭时做书签覆盖
 async function handleTabUpdate(tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab): Promise<void> {
-  const nextUrl = changeInfo.url ?? tab.url
-
-  if (nextUrl && !isHttpUrl(nextUrl)) {
-    // 一旦标签页切到非网页协议，就清除缓存状态，避免关闭标签页时误用旧网页 URL 覆盖书签。
-    const map = await getTabStateMap()
-    delete map[String(tabId)]
-    await setTabStateMap(map)
-    return
-  }
-
-  const nextTitle = changeInfo.title ?? tab.title
-
-  if (!nextUrl && !nextTitle) {
-    return
-  }
-
-  const map = await getTabStateMap()
   const key = String(tabId)
+  const nextUrl = changeInfo.url ?? tab.url
+  const nextTitle = changeInfo.title ?? tab.title
+  const map = await getTabStateMap()
   const state = map[key] ?? {}
+  const previousUrl = state.lastUrl
 
-  if (nextUrl && isHttpUrl(nextUrl)) {
-    state.lastUrl = nextUrl
+  if (changeInfo.url && !isHttpUrl(changeInfo.url)) {
+    // 一旦标签页切到非网页协议，先提交离开前的学习页，再清除缓存状态。
+    if (previousUrl) {
+      await commitBookmarkProgress(previousUrl)
+    }
+
+    await clearTabState(tabId)
+    return
+  }
+
+  if (changeInfo.url) {
+    const normalizedPreviousUrl = previousUrl ? normalizeUrl(previousUrl) : undefined
+    const normalizedNextUrl = normalizeUrl(changeInfo.url)
+
+    if (
+      previousUrl &&
+      normalizedPreviousUrl &&
+      normalizedNextUrl &&
+      normalizedPreviousUrl !== normalizedNextUrl
+    ) {
+      await commitBookmarkProgress(previousUrl)
+    }
+
+    if (isHttpUrl(changeInfo.url) && getMatchProfile(changeInfo.url)) {
+      state.lastUrl = changeInfo.url
+    } else {
+      await clearTabState(tabId)
+      return
+    }
   }
 
   if (nextTitle) {
     state.lastTitle = nextTitle
+  }
+
+  if (!state.lastUrl && !state.lastTitle) {
+    await clearTabState(tabId)
+    return
   }
 
   map[key] = state
@@ -382,31 +428,12 @@ async function handleTabClosed(tabId: number): Promise<void> {
 
   console.log(`[Dynamic Bookmark] Tab ${tabId} closed`)
 
-  if (!state) {
+  if (!state?.lastUrl) {
     console.log(`[Dynamic Bookmark] No state found for tab ${tabId}`)
     return
   }
 
-  // 如果找到了最近访问的网页 URL，则按双轨规则查找需要覆盖的书签。
-  if (state.lastUrl) {
-    try {
-      const targetBookmark = await findBookmarkToUpdate(state.lastUrl)
-
-      if (targetBookmark) {
-        console.log(`[Dynamic Bookmark] Updating bookmark ${targetBookmark.id} with URL: ${state.lastUrl}`)
-
-        // 关闭标签页后，仅更新书签的 URL，保持原书签标题不变。
-        const updatePayload: chrome.bookmarks.BookmarkChangesArg = { url: state.lastUrl }
-
-        await chrome.bookmarks.update(targetBookmark.id, updatePayload)
-        console.log(`[Dynamic Bookmark] Successfully updated bookmark ${targetBookmark.id}`)
-      } else {
-        console.log(`[Dynamic Bookmark] No matching bookmark found for URL: ${state.lastUrl}`)
-      }
-    } catch (error) {
-      console.error(`[Dynamic Bookmark] Failed to update bookmark for tab ${tabId}:`, error)
-    }
-  }
+  await commitBookmarkProgress(state.lastUrl)
 
   // 从映射表中移除该标签的状态并保存
   delete map[key]
