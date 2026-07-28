@@ -180,6 +180,17 @@ function IndexPopup() {
     }
   }
 
+  async function openLogsPage() {
+    try {
+      await chrome.tabs.create({
+        url: chrome.runtime.getURL("tabs/log.html")
+      })
+    } catch (error) {
+      setStatusMessage("打开日志页失败，请稍后重试。")
+      console.error("[Dynamic Bookmark] Failed to open logs page:", error)
+    }
+  }
+
   function toggleFolderPath(path: string) {
     setSelectedFolderPaths((current) => (current.includes(path) ? current.filter((p) => p !== path) : [...current, path]))
   }
@@ -413,22 +424,40 @@ function IndexPopup() {
         <div style={{ fontSize: 13, color: "#94A3B8" }}>
           已选择 {selectedFolderPaths.length} 个收藏夹
         </div>
-        <button
-          disabled={isLoading || isSaving}
-          onClick={saveManagedFolders}
-          style={{
-            border: "none",
-            borderRadius: 6,
-            padding: "8px 16px",
-            background: isSaving ? "#475569" : "#1A6F6C",
-            color: "#FFF",
-            fontSize: 13,
-            fontWeight: 500,
-            cursor: isLoading || isSaving ? "not-allowed" : "pointer",
-            transition: "background 0.2s"
-          }}>
-          {isSaving ? "保存中..." : "保存设置"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            disabled={isLoading || isSaving}
+            onClick={openLogsPage}
+            style={{
+              border: "1px solid rgba(255, 255, 255, 0.1)",
+              borderRadius: 6,
+              padding: "8px 14px",
+              background: "rgba(255, 255, 255, 0.04)",
+              color: "#F8FAFC",
+              fontSize: 13,
+              fontWeight: 500,
+              cursor: isLoading || isSaving ? "not-allowed" : "pointer",
+              transition: "background 0.2s"
+            }}>
+            日志查看
+          </button>
+          <button
+            disabled={isLoading || isSaving}
+            onClick={saveManagedFolders}
+            style={{
+              border: "none",
+              borderRadius: 6,
+              padding: "8px 16px",
+              background: isSaving ? "#475569" : "#1A6F6C",
+              color: "#FFF",
+              fontSize: 13,
+              fontWeight: 500,
+              cursor: isLoading || isSaving ? "not-allowed" : "pointer",
+              transition: "background 0.2s"
+            }}>
+            {isSaving ? "保存中..." : "保存设置"}
+          </button>
+        </div>
       </div>
 
       {statusMessage && (

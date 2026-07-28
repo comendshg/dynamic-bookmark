@@ -15,6 +15,8 @@
 ## 目录
 
 - 项目代码：[background.ts](background.ts)、[popup.tsx](popup.tsx)
+- 日志页面源码：[tabs/log.tsx](tabs/log.tsx)
+- 通用工具：[logger.ts](logger.ts)、[historyRollback.ts](historyRollback.ts)
 - 构建产物：`build/`（包含 `chrome-mv3-dev`、`chrome-mv3-prod` 等子目录）
 
 ---
@@ -40,6 +42,7 @@ npm run dev
 - 扩展会监听标签页的 URL / title 变化，并在你离开当前学习页、切换到其他网页时提前触发匹配逻辑；标签页关闭仍然作为兜底。
 - 匹配时先尝试精确（去 hash 后）匹配书签 URL，找不到则按匹配规则回退匹配。
 - 如果找到目标书签，扩展会调用 `chrome.bookmarks.update` 将书签的 `url` 更新为最近访问的地址；扩展不会更改原有的书签 `title`。
+- 所有书签 URL 更新和配置变更都会写入 `chrome.storage.local` 日志，日志页面可查看并按单条历史记录回退。
 
 匹配规则简要说明：
 
@@ -52,6 +55,7 @@ npm run dev
 
 - 被管理的书签文件夹名称列表会被持久化存储（local storage），扩展仅对这些文件夹下的书签进行监控与覆盖更新。
 - 修改方式：如果扩展包含设置界面，请在该界面中添加或移除文件夹名称；开发者或高级用户可以通过向扩展发送 runtime 消息 `set-managed-folders` 并携带 `folderTitles` 数组来修改该列表（详见源码）。
+- 日志与回退入口：主页面的“日志查看”按钮会打开独立日志面板，面板内可执行“清空全部日志”和“回退”。
 
 源码位置：主要逻辑在 [background.ts](background.ts)。
 
