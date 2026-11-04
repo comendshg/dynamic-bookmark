@@ -17,7 +17,7 @@
 - 项目代码：[background.ts](background.ts)、[popup.tsx](popup.tsx)
 - 日志页面源码：[tabs/log.tsx](tabs/log.tsx)
 - 通用工具：[logger.ts](logger.ts)、[historyRollback.ts](historyRollback.ts)
-- 构建产物：`build/`（包含 `chrome-mv3-dev`、`chrome-mv3-prod` 等子目录）
+- 构建产物：`build/`（包含 `chrome-mv3-dev`、`chrome-mv3-prod` 等子目录）。注意 `build/` 已被 `.gitignore` 忽略，克隆仓库后需要先执行 `npm run build`（或 `npm run dev`）自行生成。
 
 ---
 

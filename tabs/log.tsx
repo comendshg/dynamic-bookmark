@@ -1,18 +1,50 @@
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import {
   clearOperationLogs,
-  formatOperationSnapshot,
   getOperationLogs,
   serializeError,
-  type OperationLogEntry
+  type OperationLogEntry,
+  type OperationSnapshot
 } from "../logger"
 
-type StatusKind = "idle" | "loading" | "saving" | "error"
+type StatusKind = "idle" | "loading" | "error"
 
-function formatOperationType(operationType: string): string {
+type LogFilter = "all" | "bookmark-url-update" | "managed-folders-update" | "rollback" | "errors"
+
+const FILTER_DEFS: { key: LogFilter; label: string }[] = [
+  { key: "all", label: "全部" },
+  { key: "bookmark-url-update", label: "书签更新" },
+  { key: "managed-folders-update", label: "配置变更" },
+  { key: "rollback", label: "回退记录" },
+  { key: "errors", label: "含错误" }
+]
+
+type Accent = { color: string; bg: string; border: string }
+
+function typeAccent(operationType: string, hasError: boolean): Accent {
+  if (hasError) {
+    return { color: "#FCA5A5", bg: "rgba(248, 113, 113, 0.10)", border: "rgba(248, 113, 113, 0.30)" }
+  }
+
   if (operationType === "bookmark-url-update") {
-    return "书签 URL 更新"
+    return { color: "#5EEAD4", bg: "rgba(94, 234, 212, 0.10)", border: "rgba(94, 234, 212, 0.28)" }
+  }
+
+  if (operationType === "managed-folders-update") {
+    return { color: "#93C5FD", bg: "rgba(147, 197, 253, 0.10)", border: "rgba(147, 197, 253, 0.28)" }
+  }
+
+  if (operationType === "rollback") {
+    return { color: "#FCD34D", bg: "rgba(252, 211, 77, 0.10)", border: "rgba(252, 211, 77, 0.28)" }
+  }
+
+  return { color: "#CBD5E1", bg: "rgba(203, 213, 225, 0.08)", border: "rgba(203, 213, 225, 0.20)" }
+}
+
+function formatOperationTypeLabel(operationType: string): string {
+  if (operationType === "bookmark-url-update") {
+    return "书签更新"
   }
 
   if (operationType === "managed-folders-update") {
@@ -20,14 +52,213 @@ function formatOperationType(operationType: string): string {
   }
 
   if (operationType === "rollback") {
-    return "执行回退操作"
+    return "回退"
   }
 
   return operationType
 }
 
-function describeChange(entry: OperationLogEntry): string {
-  return `${formatOperationSnapshot(entry.before)} -> ${formatOperationSnapshot(entry.after)}`
+function formatDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  })
+}
+
+function formatRelativeTime(timestamp: number): string {
+  const diffMinutes = Math.floor((Date.now() - timestamp) / 60000)
+
+  if (diffMinutes < 1) {
+    return "刚刚"
+  }
+
+  if (diffMinutes < 60) {
+    return `${diffMinutes} 分钟前`
+  }
+
+  const diffHours = Math.floor(diffMinutes / 60)
+
+  if (diffHours < 24) {
+    return `${diffHours} 小时前`
+  }
+
+  const diffDays = Math.floor(diffHours / 24)
+
+  if (diffDays < 30) {
+    return `${diffDays} 天前`
+  }
+
+  return formatDateTime(timestamp)
+}
+
+function SnapshotView(props: { snapshot: OperationSnapshot; tone: "before" | "after" }) {
+  const { snapshot, tone } = props
+  const isBefore = tone === "before"
+
+  if (snapshot.snapshotType === "managed-folders") {
+    return (
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, minWidth: 0 }}>
+        <span style={{ flexShrink: 0, width: 40, fontSize: 11, color: isBefore ? "#64748B" : "#5EEAD4" }}>
+          {isBefore ? "变更前" : "变更后"}
+        </span>
+        {snapshot.folderTitles.length === 0 ? (
+          <span style={{ fontSize: 13, color: "#64748B" }}>未选择任何文件夹</span>
+        ) : (
+          <span style={{ fontSize: 13, color: isBefore ? "#94A3B8" : "#E2E8F0", wordBreak: "break-all" }}>
+            {snapshot.folderTitles.join(" · ")}
+          </span>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ minWidth: 0 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+        <span style={{ flexShrink: 0, width: 40, fontSize: 11, color: isBefore ? "#64748B" : "#5EEAD4" }}>
+          {isBefore ? "变更前" : "变更后"}
+        </span>
+        <span
+          style={{
+            fontSize: 13,
+            fontWeight: 500,
+            color: isBefore ? "#94A3B8" : "#F1F5F9",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap"
+          }}>
+          {snapshot.bookmarkTitle}
+        </span>
+      </div>
+      <div
+        title={snapshot.bookmarkUrl ?? undefined}
+        style={{
+          marginTop: 2,
+          marginLeft: 50,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+          fontSize: 12,
+          lineHeight: 1.5,
+          color: isBefore ? "#64748B" : "#94A3B8",
+          wordBreak: "break-all",
+          textDecoration: isBefore ? "line-through" : "none"
+        }}>
+        {snapshot.bookmarkUrl ?? "（无 URL）"}
+      </div>
+    </div>
+  )
+}
+
+function LogEntryCard(props: {
+  entry: OperationLogEntry
+  index: number
+  isRollingBack: boolean
+  anyRollingBack: boolean
+  onRollback: (entry: OperationLogEntry, rollbackKey: string) => void
+}) {
+  const { entry, index, isRollingBack, anyRollingBack, onRollback } = props
+  // 同一毫秒内可能出现多条类型相同的日志，key 需拼上序号保证唯一。
+  const rollbackKey = `${entry.timestamp}-${entry.operationType}-${index}`
+  const hasError = !!entry.error
+  const accent = typeAccent(entry.operationType, hasError)
+  // 失败的操作没有实际写入，回退它没有意义。
+  const canRollback = !hasError
+
+  return (
+    <div
+      style={{
+        padding: "14px 16px",
+        borderRadius: 12,
+        background: "rgba(255, 255, 255, 0.03)",
+        border: "1px solid rgba(255, 255, 255, 0.06)",
+        borderLeft: `3px solid ${accent.color}`,
+        opacity: isRollingBack ? 0.65 : 1,
+        transition: "opacity 0.15s ease"
+      }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            fontSize: 12,
+            fontWeight: 500,
+            padding: "3px 10px",
+            borderRadius: 999,
+            color: accent.color,
+            background: accent.bg,
+            border: `1px solid ${accent.border}`,
+            whiteSpace: "nowrap"
+          }}>
+          {hasError ? `失败 · ${formatOperationTypeLabel(entry.operationType)}` : formatOperationTypeLabel(entry.operationType)}
+        </span>
+
+        <span
+          title={formatDateTime(entry.timestamp)}
+          style={{ marginLeft: "auto", fontSize: 12, color: "#64748B", whiteSpace: "nowrap" }}>
+          {formatRelativeTime(entry.timestamp)}
+        </span>
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+          padding: "10px 12px",
+          background: "rgba(0, 0, 0, 0.25)",
+          borderRadius: 8
+        }}>
+        <SnapshotView snapshot={entry.before} tone="before" />
+        <SnapshotView snapshot={entry.after} tone="after" />
+      </div>
+
+      {hasError ? (
+        <div
+          style={{
+            marginTop: 10,
+            fontSize: 12,
+            lineHeight: 1.6,
+            color: "#FCA5A5",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+            background: "rgba(248, 113, 113, 0.06)",
+            border: "1px solid rgba(248, 113, 113, 0.20)",
+            borderRadius: 8,
+            padding: "8px 10px"
+          }}>
+          {entry.error}
+        </div>
+      ) : (
+        <div style={{ marginTop: 8, fontSize: 12, color: "#64748B" }}>{entry.remark}</div>
+      )}
+
+      <div style={{ marginTop: 10, display: "flex", justifyContent: "flex-end" }}>
+        <button
+          disabled={anyRollingBack || !canRollback}
+          title={canRollback ? "把状态恢复到这条记录变更之前" : "该操作未实际生效，无需回退"}
+          onClick={() => onRollback(entry, rollbackKey)}
+          style={{
+            border: "1px solid rgba(94, 234, 212, 0.30)",
+            borderRadius: 8,
+            padding: "7px 14px",
+            background: isRollingBack ? "rgba(94, 234, 212, 0.25)" : "rgba(94, 234, 212, 0.10)",
+            color: "#5EEAD4",
+            fontSize: 13,
+            fontWeight: 500,
+            cursor: anyRollingBack || !canRollback ? "not-allowed" : "pointer",
+            opacity: canRollback ? 1 : 0.45,
+            transition: "background 0.15s ease"
+          }}>
+          {isRollingBack ? "回退中..." : "回退"}
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function IndexLogPage() {
@@ -36,6 +267,7 @@ function IndexLogPage() {
   const [statusMessage, setStatusMessage] = useState("")
   const [isClearing, setIsClearing] = useState(false)
   const [activeRollbackKey, setActiveRollbackKey] = useState<string | null>(null)
+  const [filter, setFilter] = useState<LogFilter>("all")
 
   async function loadLogs() {
     setStatusKind("loading")
@@ -54,6 +286,38 @@ function IndexLogPage() {
   useEffect(() => {
     void loadLogs()
   }, [])
+
+  const filterCounts = useMemo(() => {
+    const counts = new Map<LogFilter, number>([
+      ["all", logs.length],
+      ["bookmark-url-update", 0],
+      ["managed-folders-update", 0],
+      ["rollback", 0],
+      ["errors", 0]
+    ])
+
+    for (const entry of logs) {
+      counts.set("errors", (counts.get("errors") ?? 0) + (entry.error ? 1 : 0))
+
+      if (entry.operationType === "bookmark-url-update" || entry.operationType === "managed-folders-update" || entry.operationType === "rollback") {
+        counts.set(entry.operationType, (counts.get(entry.operationType as LogFilter) ?? 0) + 1)
+      }
+    }
+
+    return counts
+  }, [logs])
+
+  const filteredLogs = useMemo(() => {
+    if (filter === "all") {
+      return logs
+    }
+
+    if (filter === "errors") {
+      return logs.filter((entry) => entry.error)
+    }
+
+    return logs.filter((entry) => entry.operationType === filter)
+  }, [logs, filter])
 
   async function handleClearAllLogs() {
     const confirmed = window.confirm("确定要清空全部日志吗？此操作无法恢复。")
@@ -77,14 +341,13 @@ function IndexLogPage() {
     }
   }
 
-  async function handleRollback(entry: OperationLogEntry) {
+  async function handleRollback(entry: OperationLogEntry, rollbackKey: string) {
     const confirmed = window.confirm("确定回退到这条历史记录对应的状态吗？")
 
     if (!confirmed) {
       return
     }
 
-    const rollbackKey = `${entry.timestamp}-${entry.operationType}`
     setActiveRollbackKey(rollbackKey)
 
     try {
@@ -108,13 +371,15 @@ function IndexLogPage() {
     }
   }
 
+  const anyRollingBack = activeRollbackKey !== null
+
   return (
     <div
       style={{
         minHeight: "100vh",
         padding: 24,
         boxSizing: "border-box",
-        background: "#181A1F",
+        background: "#12141A",
         color: "#F8FAFC",
         fontFamily: 'Inter, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif'
       }}>
@@ -123,7 +388,7 @@ function IndexLogPage() {
           html, body {
             margin: 0;
             padding: 0;
-            background: #181A1F;
+            background: #12141A;
           }
           ::-webkit-scrollbar { width: 8px; }
           ::-webkit-scrollbar-track { background: transparent; }
@@ -141,19 +406,33 @@ function IndexLogPage() {
           borderRadius: 16,
           padding: 20
         }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 18 }}>
           <div>
             <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: 0.2 }}>日志查看</div>
             <div style={{ marginTop: 6, fontSize: 13, lineHeight: 1.5, color: "#94A3B8" }}>
-              展示书签 URL 更新和配置变更的历史记录，支持按日志快照回退。
+              展示书签更新和配置变更的历史记录，支持按记录回退到变更前的状态。
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ display: "flex", gap: 10, flexShrink: 0 }}>
+            <button
+              onClick={() => void loadLogs()}
+              disabled={statusKind === "loading"}
+              style={{
+                border: "1px solid rgba(255, 255, 255, 0.10)",
+                borderRadius: 8,
+                padding: "10px 14px",
+                background: "rgba(255, 255, 255, 0.04)",
+                color: "#F8FAFC",
+                fontSize: 13,
+                cursor: statusKind === "loading" ? "not-allowed" : "pointer"
+              }}>
+              {statusKind === "loading" ? "刷新中..." : "刷新"}
+            </button>
             <button
               onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL("popup.html") })}
               style={{
-                border: "1px solid rgba(255, 255, 255, 0.1)",
+                border: "1px solid rgba(255, 255, 255, 0.10)",
                 borderRadius: 8,
                 padding: "10px 14px",
                 background: "rgba(255, 255, 255, 0.04)",
@@ -164,18 +443,19 @@ function IndexLogPage() {
               返回首页
             </button>
             <button
-              disabled={isClearing}
+              disabled={isClearing || logs.length === 0}
               onClick={handleClearAllLogs}
               style={{
-                border: "none",
                 borderRadius: 8,
                 padding: "10px 14px",
-                background: isClearing ? "#475569" : "#7C2D12",
-                color: "#FFF",
+                background: isClearing ? "#475569" : "rgba(220, 38, 38, 0.18)",
+                border: "1px solid rgba(220, 38, 38, 0.35)",
+                color: "#FCA5A5",
                 fontSize: 13,
-                cursor: isClearing ? "not-allowed" : "pointer"
+                cursor: isClearing || logs.length === 0 ? "not-allowed" : "pointer",
+                opacity: logs.length === 0 ? 0.5 : 1
               }}>
-              {isClearing ? "清空中..." : "清空全部日志"}
+              {isClearing ? "清空中..." : "清空全部"}
             </button>
           </div>
         </div>
@@ -186,7 +466,7 @@ function IndexLogPage() {
               marginBottom: 16,
               padding: "10px 12px",
               borderRadius: 8,
-              background: statusKind === "error" ? "rgba(220, 38, 38, 0.1)" : "rgba(34, 123, 122, 0.12)",
+              background: statusKind === "error" ? "rgba(220, 38, 38, 0.10)" : "rgba(34, 123, 122, 0.12)",
               border: statusKind === "error" ? "1px solid rgba(220, 38, 38, 0.25)" : "1px solid rgba(34, 123, 122, 0.25)",
               color: statusKind === "error" ? "#FCA5A5" : "#A7F3D0",
               fontSize: 13
@@ -195,54 +475,98 @@ function IndexLogPage() {
           </div>
         )}
 
-        {statusKind === "loading" ? (
-          <div style={{ fontSize: 13, color: "#94A3B8" }}>正在加载日志...</div>
-        ) : logs.length === 0 ? (
-          <div style={{ fontSize: 13, color: "#94A3B8" }}>暂无日志记录。</div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {logs.map((entry) => {
-              const rollbackKey = `${entry.timestamp}-${entry.operationType}`
+        {logs.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flexWrap: "wrap",
+              marginBottom: 16,
+              paddingBottom: 16,
+              borderBottom: "1px solid rgba(255, 255, 255, 0.06)"
+            }}>
+            {FILTER_DEFS.map(({ key, label }) => {
+              const count = filterCounts.get(key) ?? 0
+
+              if (key !== "all" && count === 0) {
+                return null
+              }
+
+              const isActive = filter === key
 
               return (
-                <div
-                  key={rollbackKey}
+                <button
+                  key={key}
+                  onClick={() => setFilter(key)}
                   style={{
-                    padding: 14,
-                    borderRadius: 12,
-                    background: "rgba(255, 255, 255, 0.04)",
-                    border: "1px solid rgba(255, 255, 255, 0.06)"
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "5px 12px",
+                    borderRadius: 999,
+                    fontSize: 12,
+                    fontWeight: 500,
+                    color: isActive ? "#12141A" : "#CBD5E1",
+                    background: isActive ? "#5EEAD4" : "rgba(255, 255, 255, 0.04)",
+                    border: `1px solid ${isActive ? "#5EEAD4" : "rgba(255, 255, 255, 0.10)"}`,
+                    cursor: "pointer",
+                    transition: "all 0.12s ease"
                   }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
-                    <div style={{ fontSize: 14, fontWeight: 600 }}>{formatOperationType(entry.operationType)}</div>
-                    <div style={{ fontSize: 12, color: "#94A3B8", whiteSpace: "nowrap" }}>{new Date(entry.timestamp).toLocaleString()}</div>
-                  </div>
-
-                  <div style={{ fontSize: 12, lineHeight: 1.6, color: "#CBD5E1", whiteSpace: "pre-wrap" }}>{describeChange(entry)}</div>
-
-                  <div style={{ marginTop: 8, fontSize: 12, color: entry.error ? "#FCA5A5" : "#94A3B8", whiteSpace: "pre-wrap" }}>
-                    {entry.error ? `错误：${entry.error}` : entry.remark}
-                  </div>
-
-                  <div style={{ marginTop: 12, display: "flex", justifyContent: "flex-end" }}>
-                    <button
-                      disabled={Boolean(activeRollbackKey) && activeRollbackKey !== rollbackKey}
-                      onClick={() => void handleRollback(entry)}
-                      style={{
-                        border: "1px solid rgba(34, 123, 122, 0.35)",
-                        borderRadius: 8,
-                        padding: "8px 12px",
-                        background: activeRollbackKey === rollbackKey ? "#475569" : "rgba(34, 123, 122, 0.18)",
-                        color: "#E2E8F0",
-                        fontSize: 13,
-                        cursor: activeRollbackKey ? "not-allowed" : "pointer"
-                      }}>
-                      {activeRollbackKey === rollbackKey ? "回退中..." : "回退"}
-                    </button>
-                  </div>
-                </div>
+                  {label}
+                  <span style={{ fontSize: 11, opacity: 0.75 }}>{count}</span>
+                </button>
               )
             })}
+          </div>
+        )}
+
+        {statusKind === "loading" ? (
+          <div style={{ padding: "48px 0", textAlign: "center", fontSize: 13, color: "#94A3B8" }}>
+            正在加载日志...
+          </div>
+        ) : logs.length === 0 ? (
+          <div style={{ padding: "56px 0", textAlign: "center" }}>
+            <svg
+              width="44"
+              height="44"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="#475569"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              style={{ margin: "0 auto 14px", display: "block" }}>
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+            </svg>
+            <div style={{ fontSize: 14, fontWeight: 500, color: "#94A3B8" }}>暂无日志记录</div>
+            <div style={{ marginTop: 6, fontSize: 12, color: "#64748B" }}>
+              关闭标签页更新书签、或修改插件配置后，操作会记录在这里。
+            </div>
+          </div>
+        ) : filteredLogs.length === 0 ? (
+          <div style={{ padding: "48px 0", textAlign: "center", fontSize: 13, color: "#64748B" }}>
+            当前筛选条件下没有记录。
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {filteredLogs.map((entry, index) => (
+              <LogEntryCard
+                key={`${entry.timestamp}-${entry.operationType}-${index}`}
+                entry={entry}
+                index={index}
+                isRollingBack={activeRollbackKey === `${entry.timestamp}-${entry.operationType}-${index}`}
+                anyRollingBack={anyRollingBack}
+                onRollback={(e, rollbackKey) => void handleRollback(e, rollbackKey)}
+              />
+            ))}
+          </div>
+        )}
+
+        {logs.length > 0 && (
+          <div style={{ marginTop: 14, fontSize: 12, color: "#64748B", textAlign: "center" }}>
+            共 {logs.length} 条记录，最多保留 100 条
           </div>
         )}
       </div>

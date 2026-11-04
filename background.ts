@@ -4,10 +4,15 @@ import {
   appendOperationLog,
   createBookmarkUrlSnapshot,
   createManagedFoldersSnapshot,
+  findFolderNodesByIdentifiers,
+  findFolderNodesByIds,
+  getManagedFolderIds,
+  getManagedFolderIdsState,
   getManagedFolderTitles,
-  normalizeManagedFolderTitles,
+  normalizeManagedFolderIds,
+  resolveFolderPaths,
   serializeError,
-  setManagedFolderTitles,
+  setManagedFolderIds,
   type OperationLogEntry
 } from "./logger"
 
@@ -22,6 +27,9 @@ type TabState = {
   lastUrl?: string
   // 最近一次记录到的标题（用于在标签关闭时同步更新书签标题）
   lastTitle?: string
+  // 最近一次已成功提交到书签的 URL（去 hash 后的规范化形式），
+  // 用于避免关闭标签页时把同一个地址重复写入书签和日志。
+  lastCommittedNormalizedUrl?: string
 }
 
 // 使用标签 id（string）作为 key 的映射表
@@ -51,12 +59,20 @@ async function setTabStateMap(map: TabStateMap): Promise<void> {
   await storageArea.set({ [SESSION_KEY]: map })
 }
 
+// 启动时确保托管配置存在，并把 legacy 的路径字符串配置一次性迁移为文件夹 id。
+// id 是 Chrome 书签树的稳定标识：文件夹改名、移动后仍然有效，
+// 而路径字符串在改名/移动后会静默失配，导致接管悄悄失效。
 async function ensureManagedFolderSettings(): Promise<void> {
-  const titles = await getManagedFolderTitles()
+  const idsState = await getManagedFolderIdsState()
 
-  if (titles.length === 0) {
-    await setManagedFolderTitles([])
+  if (idsState.exists) {
+    return
   }
+
+  const legacyTitles = await getManagedFolderTitles()
+  const folderNodes = await findFolderNodesByIdentifiers(legacyTitles)
+
+  await setManagedFolderIds(folderNodes.map((node) => node.id))
 }
 
 // 简单判断是否为 http(s) 类型的 URL
@@ -80,7 +96,9 @@ function extractBilibiliBvId(url: string): string | undefined {
   try {
     const parsedUrl = new URL(url)
     const match = parsedUrl.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/i)
-    return match?.[1].toUpperCase()
+    // BV 号是 base58 编码、大小写敏感，不能做大小写归一化，
+    // 否则仅大小写不同的两个视频会被误判为同一个进度桶。
+    return match?.[1]
   } catch {
     return undefined
   }
@@ -128,99 +146,27 @@ function getMatchProfile(url: string): MatchProfile | undefined {
   return undefined
 }
 
-async function getBookmarkBarRootNode(): Promise<chrome.bookmarks.BookmarkTreeNode | undefined> {
-  const tree = await chrome.bookmarks.getTree()
-  const rootNode = tree[0]
-  const directChildren = rootNode?.children ?? []
+// 判断两个 URL 是否属于同一个"进度桶"（同一 BV 号，或同一课程前缀）。
+// 在同一门课程 / 同一个视频内连续翻页时不应触发中间提交：
+// 等真正离开该桶或关闭标签页时，一次性写入最终位置，
+// 避免"看一次视频 / 读一次课程"在日志里产生多条中间记录。
+function isSameMatchBucket(urlA: string, urlB: string): boolean {
+  const profileA = getMatchProfile(urlA)
+  const profileB = getMatchProfile(urlB)
 
-  // Chrome 的书签栏根节点通常是 id = "1"；如果未来环境不同，则退回到第一个顶层文件夹。
-  return directChildren.find((node) => node.id === "1") ?? directChildren[0]
-}
-
-async function findFolderNodesByTitles(titles: string[]): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
-  // 保持向后兼容：此函数仍然存在，但更通用的查找器在下方实现。
-  const normalizedTitles = new Set(normalizeManagedFolderTitles(titles))
-
-  if (normalizedTitles.size === 0) {
-    return []
+  if (!profileA || !profileB || profileA.type !== profileB.type) {
+    return false
   }
 
-  const bookmarkBarRoot = await getBookmarkBarRootNode()
-
-  if (!bookmarkBarRoot) {
-    return []
+  if (profileA.type === "bilibili" && profileB.type === "bilibili") {
+    return profileA.bvId === profileB.bvId
   }
 
-  const matchedNodes: chrome.bookmarks.BookmarkTreeNode[] = []
-  const stack = [...(bookmarkBarRoot.children ?? [])]
-
-  while (stack.length > 0) {
-    const node = stack.pop()
-
-    if (!node) continue
-
-    if (!node.url && normalizedTitles.has(node.title)) {
-      matchedNodes.push(node)
-    }
-
-    if (node.children?.length) stack.push(...node.children)
+  if (profileA.type === "course" && profileB.type === "course") {
+    return profileA.prefix === profileB.prefix
   }
 
-  return matchedNodes
-}
-
-// 支持按 "父 / 子 / 子" 路径查找节点，也支持传统只按标题匹配的标识符。
-async function findFolderNodesByIdentifiers(identifiers: string[]): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
-  const bookmarkBarRoot = await getBookmarkBarRootNode()
-
-  if (!bookmarkBarRoot || identifiers.length === 0) return []
-
-  const matchedById = new Map<string, chrome.bookmarks.BookmarkTreeNode>()
-
-  for (const raw of identifiers) {
-    if (typeof raw !== "string") continue
-
-    const id = raw.trim()
-    if (!id) continue
-
-    if (id.includes("/")) {
-      const parts = id.split("/").map((s) => s.trim()).filter(Boolean)
-      if (parts.length === 0) continue
-
-      // 从书签栏一级开始匹配
-      let currentNodes = bookmarkBarRoot.children ?? []
-      let foundNode: chrome.bookmarks.BookmarkTreeNode | undefined
-
-      for (const part of parts) {
-        foundNode = (currentNodes.find((n) => n.title === part && !n.url))
-
-        if (!foundNode) break
-
-        currentNodes = foundNode.children ?? []
-      }
-
-      if (foundNode) matchedById.set(foundNode.id, foundNode)
-    } else {
-      // legacy: match by title anywhere
-      const stack = [...(bookmarkBarRoot.children ?? [])]
-
-      while (stack.length > 0) {
-        const node = stack.pop()
-
-        if (!node) continue
-
-        if (!node.url && node.title === id) matchedById.set(node.id, node)
-
-        if (node.children?.length) stack.push(...node.children)
-      }
-    }
-  }
-
-  return [...matchedById.values()]
-}
-
-async function ensureMonitorFolderNode(): Promise<chrome.bookmarks.BookmarkTreeNode | undefined> {
-  return undefined
+  return false
 }
 
 async function collectBookmarksUnderFolder(folderNode: chrome.bookmarks.BookmarkTreeNode): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
@@ -247,13 +193,22 @@ async function collectBookmarksUnderFolder(folderNode: chrome.bookmarks.Bookmark
 }
 
 async function collectBookmarksUnderManagedFolders(): Promise<chrome.bookmarks.BookmarkTreeNode[]> {
-  const managedFolderTitles = await getManagedFolderTitles()
+  const idsState = await getManagedFolderIdsState()
+  let folderIds = idsState.ids
 
-  if (managedFolderTitles.length === 0) {
+  if (!idsState.exists) {
+    // ids 键尚未写入（理论上启动时已迁移，这里做防御性兜底）：
+    // 回退到 legacy 路径字符串匹配。
+    const legacyTitles = await getManagedFolderTitles()
+    const legacyNodes = await findFolderNodesByIdentifiers(legacyTitles)
+    folderIds = legacyNodes.map((node) => node.id)
+  }
+
+  if (folderIds.length === 0) {
     return []
   }
 
-  const folderNodes = await findFolderNodesByIdentifiers(managedFolderTitles)
+  const folderNodes = await findFolderNodesByIds(folderIds)
   const bookmarksById = new Map<string, chrome.bookmarks.BookmarkTreeNode>()
 
   for (const folderNode of folderNodes) {
@@ -327,6 +282,16 @@ async function commitBookmarkProgress(sourceUrl: string): Promise<boolean> {
     const beforeSnapshot = createBookmarkUrlSnapshot(targetBookmark)
     const afterSnapshot = createBookmarkUrlSnapshot({ ...targetBookmark, url: sourceUrl })
 
+    // 若书签当前 URL（去 hash 后）已经与要写入的地址一致，跳过这次更新，
+    // 避免无意义的 bookmarks.update 调用和内容重复的日志。
+    const currentNormalizedUrl = normalizeUrl(targetBookmark.url ?? "")
+    const nextNormalizedUrl = normalizeUrl(sourceUrl)
+
+    if (currentNormalizedUrl && nextNormalizedUrl && currentNormalizedUrl === nextNormalizedUrl) {
+      console.log(`[Dynamic Bookmark] Skip update because bookmark ${targetBookmark.id} is already synced`)
+      return true
+    }
+
     // 只更新 URL，保持原书签标题不变。
     await chrome.bookmarks.update(targetBookmark.id, { url: sourceUrl })
 
@@ -362,6 +327,23 @@ async function commitBookmarkProgress(sourceUrl: string): Promise<boolean> {
   }
 }
 
+// 把同一标签页的事件处理串行化：onUpdated / onRemoved 可能并发触发，
+// 若不排队，多个异步流程会对 storage 中的映射表做并发读改写，
+// 导致状态丢失、已删除状态"复活"、或用旧 URL 误更新书签。
+const tabOperationQueues = new Map<number, Promise<unknown>>()
+
+function enqueueTabOperation<T>(tabId: number, operation: () => Promise<T>): Promise<T> {
+  const previous = tabOperationQueues.get(tabId) ?? Promise.resolve()
+  const next = previous.catch(() => undefined).then(operation).finally(() => {
+    if (tabOperationQueues.get(tabId) === next) {
+      tabOperationQueues.delete(tabId)
+    }
+  })
+
+  tabOperationQueues.set(tabId, next)
+  return next
+}
+
 async function clearTabState(tabId: number): Promise<void> {
   const map = await getTabStateMap()
   delete map[String(tabId)]
@@ -371,7 +353,6 @@ async function clearTabState(tabId: number): Promise<void> {
 // 当标签页信息发生变化时，记录最新 URL 和标题，供关闭时做书签覆盖
 async function handleTabUpdate(tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab): Promise<void> {
   const key = String(tabId)
-  const nextUrl = changeInfo.url ?? tab.url
   const nextTitle = changeInfo.title ?? tab.title
   const map = await getTabStateMap()
   const state = map[key] ?? {}
@@ -380,7 +361,11 @@ async function handleTabUpdate(tabId: number, changeInfo: chrome.tabs.TabChangeI
   if (changeInfo.url && !isHttpUrl(changeInfo.url)) {
     // 一旦标签页切到非网页协议，先提交离开前的学习页，再清除缓存状态。
     if (previousUrl) {
-      await commitBookmarkProgress(previousUrl)
+      const committed = await commitBookmarkProgress(previousUrl)
+
+      if (committed) {
+        state.lastCommittedNormalizedUrl = normalizeUrl(previousUrl)
+      }
     }
 
     await clearTabState(tabId)
@@ -395,9 +380,16 @@ async function handleTabUpdate(tabId: number, changeInfo: chrome.tabs.TabChangeI
       previousUrl &&
       normalizedPreviousUrl &&
       normalizedNextUrl &&
-      normalizedPreviousUrl !== normalizedNextUrl
+      normalizedPreviousUrl !== normalizedNextUrl &&
+      // 同一进度桶内的连续翻页不算"离开"，不做中间提交，
+      // 避免一次阅读产生多条日志（详见 isSameMatchBucket 注释）。
+      !isSameMatchBucket(previousUrl, changeInfo.url)
     ) {
-      await commitBookmarkProgress(previousUrl)
+      const committed = await commitBookmarkProgress(previousUrl)
+
+      if (committed) {
+        state.lastCommittedNormalizedUrl = normalizedPreviousUrl
+      }
     }
 
     if (isHttpUrl(changeInfo.url) && getMatchProfile(changeInfo.url)) {
@@ -434,6 +426,16 @@ async function handleTabClosed(tabId: number): Promise<void> {
     return
   }
 
+  const normalizedLastUrl = normalizeUrl(state.lastUrl)
+
+  // 如果这个 URL 在离开页面时已经提交过（例如切换 URL 时触发过一次），
+  // 关闭标签页时不再重复更新书签，也不再写一条内容相同的日志。
+  if (normalizedLastUrl && state.lastCommittedNormalizedUrl === normalizedLastUrl) {
+    delete map[key]
+    await setTabStateMap(map)
+    return
+  }
+
   await commitBookmarkProgress(state.lastUrl)
 
   // 从映射表中移除该标签的状态并保存
@@ -449,6 +451,7 @@ async function initializeMonitorFolder(): Promise<void> {
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
   const nextMessage = message as {
     type?: string
+    folderIds?: unknown
     folderTitles?: unknown
     entry?: unknown
   }
@@ -476,41 +479,53 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
   }
 
   void (async () => {
-    const beforeTitles = await getManagedFolderTitles()
-    const folderTitles = Array.isArray(nextMessage.folderTitles)
-      ? nextMessage.folderTitles.filter((title): title is string => typeof title === "string")
-      : []
-    const normalizedTitles = normalizeManagedFolderTitles(folderTitles)
+    const beforeIds = await getManagedFolderIds()
 
-    await setManagedFolderTitles(folderTitles)
-    await ensureMonitorFolderNode()
+    // 新协议：直接传文件夹 id 数组。
+    // 兼容旧协议：若只收到路径/标题字符串，先解析为 id。
+    let folderIds: string[]
+
+    if (Array.isArray(nextMessage.folderIds)) {
+      folderIds = nextMessage.folderIds.filter((id): id is string => typeof id === "string")
+    } else if (Array.isArray(nextMessage.folderTitles)) {
+      const titles = nextMessage.folderTitles.filter((title): title is string => typeof title === "string")
+      folderIds = (await findFolderNodesByIdentifiers(titles)).map((node) => node.id)
+    } else {
+      folderIds = []
+    }
+
+    const normalizedIds = normalizeManagedFolderIds(folderIds)
+
+    await setManagedFolderIds(normalizedIds)
+
+    // 日志快照仍然存人类可读的路径，方便在日志页直接阅读；
+    // 回退时再把路径解析回 id（见 historyRollback.ts）。
+    const beforePaths = await resolveFolderPaths(beforeIds)
+    const afterPaths = await resolveFolderPaths(normalizedIds)
 
     await appendOperationLog({
       timestamp: Date.now(),
       operationType: "managed-folders-update",
-      before: createManagedFoldersSnapshot(beforeTitles),
-      after: createManagedFoldersSnapshot(normalizedTitles),
+      before: createManagedFoldersSnapshot(beforePaths),
+      after: createManagedFoldersSnapshot(afterPaths),
       error: null,
       remark: "配置变更"
     })
 
-    sendResponse({ ok: true, folderTitles: normalizedTitles })
+    sendResponse({ ok: true, folderIds: normalizedIds })
   })().catch((error) => {
     console.error("[Dynamic Bookmark] Failed to update managed folders:", error)
 
     void (async () => {
       try {
-        const beforeTitles = await getManagedFolderTitles()
-        const folderTitles = Array.isArray(nextMessage.folderTitles)
-          ? nextMessage.folderTitles.filter((title): title is string => typeof title === "string")
-          : []
-        const normalizedTitles = normalizeManagedFolderTitles(folderTitles)
+        const beforeIds = await getManagedFolderIds()
+        const beforePaths = await resolveFolderPaths(beforeIds)
 
         await appendOperationLog({
           timestamp: Date.now(),
           operationType: "managed-folders-update",
-          before: createManagedFoldersSnapshot(beforeTitles),
-          after: createManagedFoldersSnapshot(normalizedTitles),
+          before: createManagedFoldersSnapshot(beforePaths),
+          after: createManagedFoldersSnapshot([]),
           error: serializeError(error),
           remark: "配置变更"
         })
@@ -530,6 +545,12 @@ chrome.runtime.onInstalled.addListener(() => {
 })
 
 chrome.runtime.onStartup.addListener(() => {
+  // 若环境不支持 session 存储（已降级到 local），映射表会跨浏览器会话残留；
+  // 浏览器重启后 tabId 可能被复用，导致用旧 URL 误更新书签，因此启动时清空。
+  if (!chrome.storage.session) {
+    void storageArea.remove(SESSION_KEY)
+  }
+
   void initializeMonitorFolder()
 })
 
@@ -541,10 +562,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     return
   }
 
-  void handleTabUpdate(tabId, changeInfo, tab)
+  void enqueueTabOperation(tabId, () => handleTabUpdate(tabId, changeInfo, tab))
 })
 
 // 监听标签页移除事件，触发时调用 handleTabClosed
 chrome.tabs.onRemoved.addListener((tabId) => {
-  void handleTabClosed(tabId)
+  void enqueueTabOperation(tabId, () => handleTabClosed(tabId))
 })

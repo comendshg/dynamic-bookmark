@@ -2,16 +2,20 @@ import {
   appendOperationLog,
   createBookmarkUrlSnapshot,
   createManagedFoldersSnapshot,
-  getManagedFolderTitles,
+  findFolderNodesByIdentifiers,
+  getManagedFolderIds,
+  resolveFolderPaths,
   serializeError,
-  setManagedFolderTitles,
+  setManagedFolderIds,
   type OperationLogEntry,
   type OperationSnapshot
 } from "./logger"
 
 async function readCurrentSnapshot(snapshot: OperationSnapshot): Promise<OperationSnapshot> {
   if (snapshot.snapshotType === "managed-folders") {
-    return createManagedFoldersSnapshot(await getManagedFolderTitles())
+    // 配置以 id 存储，快照仍然用路径展示。
+    const currentIds = await getManagedFolderIds()
+    return createManagedFoldersSnapshot(await resolveFolderPaths(currentIds))
   }
 
   const bookmarks = await chrome.bookmarks.get(snapshot.bookmarkId)
@@ -26,7 +30,9 @@ async function readCurrentSnapshot(snapshot: OperationSnapshot): Promise<Operati
 
 async function applySnapshot(snapshot: OperationSnapshot): Promise<void> {
   if (snapshot.snapshotType === "managed-folders") {
-    await setManagedFolderTitles(snapshot.folderTitles)
+    // 历史快照里存的是路径字符串，回退时解析回文件夹 id 再写入配置。
+    const folderNodes = await findFolderNodesByIdentifiers(snapshot.folderTitles)
+    await setManagedFolderIds(folderNodes.map((node) => node.id))
     return
   }
 

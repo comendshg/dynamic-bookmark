@@ -9,12 +9,8 @@
     "./**/*.tsx"
   ],
   "compilerOptions": {
-    "ignoreDeprecations": "6.0",
-    "paths": {
-      "~*": [
-        "./*"
-      ]
-    },
-    "baseUrl": "."
+    // 覆盖 plasmo 基础模板的 "node"（node10，TS 7.0 将移除）：
+    // bundler 是打包器类项目（parcel/plasmo）的推荐解析策略，新版 TS 不再告警。
+    "moduleResolution": "bundler"
   }
 }

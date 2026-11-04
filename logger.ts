@@ -1,8 +1,11 @@
 const persistentStorageArea = chrome.storage.local
 
 export const MANAGED_FOLDER_TITLES_KEY = "managedFolderTitles"
+export const MANAGED_FOLDER_IDS_KEY = "managedFolderIds"
 export const BOOKMARK_OPERATION_LOGS_KEY = "bookmarkOperationLogs"
 export const MAX_OPERATION_LOGS = 100
+
+export const FOLDER_PATH_SEPARATOR = " / "
 
 type PlainObject = Record<string, unknown>
 
@@ -143,6 +146,185 @@ export async function setManagedFolderTitles(titles: string[]): Promise<void> {
   await persistentStorageArea.set({
     [MANAGED_FOLDER_TITLES_KEY]: normalizeManagedFolderTitles(titles)
   })
+}
+
+export function normalizeManagedFolderIds(ids: string[]): string[] {
+  const uniqueIds = new Set<string>()
+
+  for (const id of ids) {
+    const normalizedId = typeof id === "string" ? id.trim() : ""
+
+    if (normalizedId) {
+      uniqueIds.add(normalizedId)
+    }
+  }
+
+  return [...uniqueIds]
+}
+
+// 区分「还没设置过」和「设置为空」：
+// 前者需要走一次 legacy titles -> ids 的迁移，后者表示用户明确不接管任何文件夹。
+export type ManagedFolderIdsState = {
+  ids: string[]
+  exists: boolean
+}
+
+export async function getManagedFolderIdsState(): Promise<ManagedFolderIdsState> {
+  const result = await persistentStorageArea.get(MANAGED_FOLDER_IDS_KEY)
+  const storedIds = result[MANAGED_FOLDER_IDS_KEY]
+
+  if (!Array.isArray(storedIds)) {
+    return { ids: [], exists: false }
+  }
+
+  return {
+    ids: normalizeManagedFolderIds(storedIds.filter((id): id is string => typeof id === "string")),
+    exists: true
+  }
+}
+
+export async function getManagedFolderIds(): Promise<string[]> {
+  return (await getManagedFolderIdsState()).ids
+}
+
+export async function setManagedFolderIds(ids: string[]): Promise<void> {
+  await persistentStorageArea.set({
+    [MANAGED_FOLDER_IDS_KEY]: normalizeManagedFolderIds(ids)
+  })
+}
+
+type ChromeBookmarkNode = chrome.bookmarks.BookmarkTreeNode
+
+async function getBookmarkTreeRoots(): Promise<ChromeBookmarkNode[]> {
+  const tree = await chrome.bookmarks.getTree()
+  return tree[0]?.children ?? []
+}
+
+// Chrome 书签栏根节点（id = "1"），找不到时退回第一个顶层文件夹。
+async function getBookmarkBarRootNode(): Promise<ChromeBookmarkNode | undefined> {
+  const roots = await getBookmarkTreeRoots()
+  return roots.find((node) => node.id === "1") ?? roots[0]
+}
+
+// 遍历整棵书签树，建立 id -> 节点 的映射（含所有位置的书签，不限于书签栏）。
+export async function buildFolderNodesById(): Promise<Map<string, ChromeBookmarkNode>> {
+  const map = new Map<string, ChromeBookmarkNode>()
+  const stack = await getBookmarkTreeRoots()
+
+  while (stack.length > 0) {
+    const node = stack.pop()
+
+    if (!node) continue
+
+    if (!node.url) {
+      map.set(node.id, node)
+    }
+
+    if (node.children?.length) {
+      stack.push(...node.children)
+    }
+  }
+
+  return map
+}
+
+// 按稳定 id 查找文件夹节点。id 不会因为改名、移动而变化，
+// 因此基于 id 的配置比基于路径字符串的配置可靠得多。
+export async function findFolderNodesByIds(ids: string[]): Promise<ChromeBookmarkNode[]> {
+  if (ids.length === 0) {
+    return []
+  }
+
+  const nodesById = await buildFolderNodesById()
+
+  return ids
+    .map((id) => nodesById.get(id))
+    .filter((node): node is ChromeBookmarkNode => !!node && !node.url)
+}
+
+// 遍历整棵树，建立 文件夹 id -> 展示路径（"A / B / C"） 的映射。
+export async function buildFolderPathsById(): Promise<Map<string, string>> {
+  const pathsById = new Map<string, string>()
+
+  function walk(nodes: ChromeBookmarkNode[], parentTitles: string[]) {
+    for (const node of nodes) {
+      if (node.url) continue
+
+      const titles = [...parentTitles, node.title]
+      pathsById.set(node.id, titles.join(FOLDER_PATH_SEPARATOR))
+
+      if (node.children?.length) {
+        walk(node.children, titles)
+      }
+    }
+  }
+
+  const roots = await getBookmarkTreeRoots()
+  walk(roots, [])
+
+  return pathsById
+}
+
+// 把一组文件夹 id 解析为人类可读的路径（用于日志展示）。
+export async function resolveFolderPaths(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) {
+    return []
+  }
+
+  const pathsById = await buildFolderPathsById()
+
+  return ids.map((id) => pathsById.get(id)).filter((path): path is string => !!path)
+}
+
+// 支持按 "父 / 子 / 子" 路径查找节点，也支持传统只按标题匹配的标识符。
+// 仅用于 legacy 配置迁移和配置回退（历史日志里存的是路径字符串）。
+export async function findFolderNodesByIdentifiers(identifiers: string[]): Promise<ChromeBookmarkNode[]> {
+  const bookmarkBarRoot = await getBookmarkBarRootNode()
+
+  if (!bookmarkBarRoot || identifiers.length === 0) return []
+
+  const matchedById = new Map<string, ChromeBookmarkNode>()
+
+  for (const raw of identifiers) {
+    if (typeof raw !== "string") continue
+
+    const id = raw.trim()
+    if (!id) continue
+
+    if (id.includes("/")) {
+      const parts = id.split("/").map((s) => s.trim()).filter(Boolean)
+      if (parts.length === 0) continue
+
+      // 从书签栏一级开始匹配
+      let currentNodes = bookmarkBarRoot.children ?? []
+      let foundNode: ChromeBookmarkNode | undefined
+
+      for (const part of parts) {
+        foundNode = (currentNodes.find((n) => n.title === part && !n.url))
+
+        if (!foundNode) break
+
+        currentNodes = foundNode.children ?? []
+      }
+
+      if (foundNode) matchedById.set(foundNode.id, foundNode)
+    } else {
+      // legacy: match by title anywhere
+      const stack = [...(bookmarkBarRoot.children ?? [])]
+
+      while (stack.length > 0) {
+        const node = stack.pop()
+
+        if (!node) continue
+
+        if (!node.url && node.title === id) matchedById.set(node.id, node)
+
+        if (node.children?.length) stack.push(...node.children)
+      }
+    }
+  }
+
+  return [...matchedById.values()]
 }
 
 export async function getOperationLogs(): Promise<OperationLogEntry[]> {
