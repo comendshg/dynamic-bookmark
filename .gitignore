@@ -30,7 +30,10 @@ dist/
 .plasmo
 
 # typescript
-.tsbuildinfo
+*.tsbuildinfo
 
 # workbuddy
 .workbuddy/
+
+# design
+design/
