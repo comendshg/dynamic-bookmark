@@ -3,6 +3,7 @@ const persistentStorageArea = chrome.storage.local
 export const MANAGED_FOLDER_TITLES_KEY = "managedFolderTitles"
 export const MANAGED_FOLDER_IDS_KEY = "managedFolderIds"
 export const BOOKMARK_OPERATION_LOGS_KEY = "bookmarkOperationLogs"
+export const EXTENSION_ENABLED_KEY = "dynamicBookmarkEnabled"
 export const MAX_OPERATION_LOGS = 100
 
 export const FOLDER_PATH_SEPARATOR = " / "
@@ -190,6 +191,20 @@ export async function getManagedFolderIds(): Promise<string[]> {
 export async function setManagedFolderIds(ids: string[]): Promise<void> {
   await persistentStorageArea.set({
     [MANAGED_FOLDER_IDS_KEY]: normalizeManagedFolderIds(ids)
+  })
+}
+
+// 总开关：默认开启。关闭后后台不再更新任何书签（手动撤销仍可用）。
+export async function getExtensionEnabled(): Promise<boolean> {
+  const result = await persistentStorageArea.get(EXTENSION_ENABLED_KEY)
+  const stored = result[EXTENSION_ENABLED_KEY]
+
+  return typeof stored === "boolean" ? stored : true
+}
+
+export async function setExtensionEnabled(enabled: boolean): Promise<void> {
+  await persistentStorageArea.set({
+    [EXTENSION_ENABLED_KEY]: !!enabled
   })
 }
 

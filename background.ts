@@ -6,6 +6,7 @@ import {
   createManagedFoldersSnapshot,
   findFolderNodesByIdentifiers,
   findFolderNodesByIds,
+  getExtensionEnabled,
   getManagedFolderIds,
   getManagedFolderIdsState,
   getManagedFolderTitles,
@@ -271,6 +272,13 @@ async function commitBookmarkProgress(sourceUrl: string): Promise<boolean> {
   let targetBookmark: chrome.bookmarks.BookmarkTreeNode | undefined
 
   try {
+    // 总开关关闭时不更新任何书签：用户明确要求暂停时静默跳过，
+    // 既不写书签也不写日志。
+    if (!(await getExtensionEnabled())) {
+      console.log("[Dynamic Bookmark] Paused, skip bookmark update")
+      return false
+    }
+
     targetBookmark = await findBookmarkToUpdate(sourceUrl)
 
     if (!targetBookmark) {
@@ -352,6 +360,11 @@ async function clearTabState(tabId: number): Promise<void> {
 
 // 当标签页信息发生变化时，记录最新 URL 和标题，供关闭时做书签覆盖
 async function handleTabUpdate(tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab): Promise<void> {
+  // 暂停期间不记录任何浏览痕迹（不写会话状态，自然也不会在关闭时提交）。
+  if (!(await getExtensionEnabled())) {
+    return
+  }
+
   const key = String(tabId)
   const nextTitle = changeInfo.title ?? tab.title
   const map = await getTabStateMap()
@@ -417,6 +430,17 @@ async function handleTabUpdate(tabId: number, changeInfo: chrome.tabs.TabChangeI
 async function handleTabClosed(tabId: number): Promise<void> {
   const map = await getTabStateMap()
   const key = String(tabId)
+
+  // 暂停期间不提交，顺手清掉暂停前可能残留的状态，避免恢复后拿着旧 URL 误更新。
+  if (!(await getExtensionEnabled())) {
+    if (key in map) {
+      delete map[key]
+      await setTabStateMap(map)
+    }
+
+    return
+  }
+
   const state = map[key]
 
   console.log(`[Dynamic Bookmark] Tab ${tabId} closed`)
